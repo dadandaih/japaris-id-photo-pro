@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser
+import threading
+import queue
 from PIL import Image, ImageTk, ImageOps
 from pathlib import Path
 
@@ -18,6 +20,8 @@ class JaparisApp:
         self.preview_ref = None
         self.bg_color = '#ffffff'
         self.cutout_ready = False
+        self.bg_queue = queue.Queue()
+        self.bg_busy = False
         self._build_ui()
 
     def _build_ui(self):
@@ -33,7 +37,7 @@ class JaparisApp:
         side.pack_propagate(False)
         tk.Label(side, text='TOOLS', fg='#9eabc0', bg='#222733', font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 10))
         self._btn(side, 'Buka Foto', self.open_photo)
-        self._btn(side, 'AI Hapus Background', self.remove_background)
+        self.bg_button = self._btn(side, 'AI Hapus Background', self.remove_background)
         self._btn(side, 'Pilih Warna Background', self.choose_bg)
         self._btn(side, 'Terapkan Background Solid', self.apply_background)
         self._btn(side, 'Smart Resolution Check', self.smart_resolution)
@@ -53,9 +57,14 @@ class JaparisApp:
 
     def _btn(self, parent, text, command, accent=False):
         bg = '#236b55' if accent else '#303949'
-        tk.Button(parent, text=text, command=command, bg=bg, fg='white', activebackground='#3b4960', activeforeground='white', relief='flat', bd=0, padx=10, pady=10, anchor='w', font=('Segoe UI', 10, 'bold' if accent else 'normal')).pack(fill='x', pady=4)
+        button = tk.Button(parent, text=text, command=command, bg=bg, fg='white', activebackground='#3b4960', activeforeground='white', relief='flat', bd=0, padx=10, pady=10, anchor='w', font=('Segoe UI', 10, 'bold' if accent else 'normal'))
+        button.pack(fill='x', pady=4)
+        return button
 
     def open_photo(self):
+        if self.bg_busy:
+            messagebox.showinfo('Sedang memproses', 'Tunggu proses AI selesai sebelum membuka foto lain.')
+            return
         path = filedialog.askopenfilename(filetypes=[('Image files', '*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff')])
         if not path: return
         try:
@@ -79,23 +88,49 @@ class JaparisApp:
 
     def remove_background(self):
         if self.working is None:
-            messagebox.showinfo('Info', 'Buka foto terlebih dahulu.'); return
+            messagebox.showinfo('Info', 'Buka foto terlebih dahulu.')
+            return
+        if self.bg_busy:
+            return
+
+        # Jalankan model AI di thread terpisah agar jendela tidak Not Responding.
+        # Pada pemakaian pertama, rembg dapat mengunduh model U2NET (sekitar 170 MB).
+        image_for_worker = self.working.copy()
+        self.bg_busy = True
+        self.bg_button.configure(state='disabled', text='Memproses AI...')
+        self.status.set('AI sedang menyiapkan model dan memotong background. Pemakaian pertama dapat mengunduh model; jendela tetap bisa digunakan.')
+
+        def worker():
+            try:
+                from rembg import remove, new_session
+                session = new_session('u2net')
+                result = remove(image_for_worker, session=session).convert('RGBA')
+                self.bg_queue.put(('success', result))
+            except Exception as exc:
+                self.bg_queue.put(('error', str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(200, self._check_background_result)
+
+    def _check_background_result(self):
         try:
-            from rembg import remove, new_session
-            self.status.set('Memproses AI background removal...')
-            self.root.update_idletasks()
-            session = new_session('u2net')
-            result = remove(self.working, session=session)
-            self.working = result.convert('RGBA')
+            kind, payload = self.bg_queue.get_nowait()
+        except queue.Empty:
+            if self.bg_busy:
+                self.root.after(200, self._check_background_result)
+            return
+
+        self.bg_busy = False
+        self.bg_button.configure(state='normal', text='AI Hapus Background')
+        if kind == 'success':
+            self.working = payload
             self.cutout_ready = True
             self._refresh()
             self.status.set('Background berhasil dipisahkan. Periksa tepi rambut dan bahu.')
-        except ImportError:
-            messagebox.showwarning('Komponen belum terpasang', 'AI background removal membutuhkan instalasi requirements. Jalankan INSTALL.bat terlebih dahulu.')
-            self.status.set('Modul rembg belum terpasang.')
-        except Exception as e:
-            messagebox.showerror('AI cutout gagal', str(e))
-            self.status.set('Gagal memproses background.')
+            messagebox.showinfo('Selesai', 'Background berhasil dipisahkan. Periksa hasil rambut dan tepi bahu.')
+        else:
+            self.status.set('AI background removal gagal. Foto asli tetap aman.')
+            messagebox.showerror('AI cutout gagal', payload + '\n\nJika ini pemakaian pertama, pastikan internet aktif agar model U2NET dapat diunduh. Setelah model tersimpan, pemrosesan berikutnya dapat dilakukan lokal.')
 
     def choose_bg(self):
         color = colorchooser.askcolor(color=self.bg_color, title='Pilih warna background')
